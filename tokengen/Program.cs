@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -133,6 +135,49 @@ namespace tokengen
             }
         }
 
+        public class CacheEntry
+        {
+            public string IdToken { get; set; }
+            public string AccessToken { get; set; }
+            public DateTimeOffset Expiration { get; set; }
+        }
+
+        private static IDictionary<string, CacheEntry> tokenCache;
+
+        private static void LoadCache()
+        {
+            var cacheFileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".tokengen_cache.json");
+            string content;
+            try
+            {
+                content = File.ReadAllText(cacheFileName);
+            }
+            catch (FileNotFoundException e)
+            {
+                content = "{}";
+            }
+
+            tokenCache = JsonConvert.DeserializeObject<Dictionary<string, CacheEntry>>(content) ?? new Dictionary<string, CacheEntry>();
+        }
+
+        private static void SaveCache()
+        {
+            var cacheFileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".tokengen_cache.json");
+            foreach (var (key, value) in tokenCache)
+            {
+                if (value.Expiration - DateTimeOffset.UtcNow <= TimeSpan.FromMinutes(5))
+                {
+                    tokenCache.Remove(key);
+                }
+            }
+
+            using var file = File.CreateText(cacheFileName);
+            var serializer = new JsonSerializer();
+            serializer.Serialize(file, tokenCache);
+        }
+
         private static async Task<string> GetToken(Options options)
         {
             var config = new Config(options);
@@ -141,6 +186,30 @@ namespace tokengen
                 await Console.Error.WriteLineAsync($"ERROR: Missing command line arguments.");
                 throw new InvalidDataException();
             }
+
+            LoadCache();
+
+            var key = $"{config.ClientId}\t{config.Tenant}\t{config.Authority}\t{config.Resource}";
+            if (tokenCache != null && tokenCache.ContainsKey(key))
+            {
+                // Check if the token is expired
+                var expiration = tokenCache[key].Expiration;
+                if (expiration - DateTimeOffset.UtcNow > TimeSpan.FromMinutes(5))
+                {
+                    // The token is still valid in next 5 minutes
+                    switch (options.Type)
+                    {
+                        case "id":
+                            return tokenCache[key].IdToken;
+                        case "access":
+                            return tokenCache[key].AccessToken;
+                        default:
+                            await Console.Error.WriteLineAsync($"ERROR: Unknown token type '{options.Type}'.");
+                            throw new InvalidDataException();
+                    }
+                }
+            }
+
             var app = ConfidentialClientApplicationBuilder
                 .Create(config.ClientId)
                 .WithClientSecret(config.Secret)
@@ -148,6 +217,15 @@ namespace tokengen
                 .Build();
             var result = await app.AcquireTokenForClient(new string[] { $"{config.Resource}/.default" })
                 .ExecuteAsync();
+            
+            tokenCache[key] = new CacheEntry
+            {
+                IdToken = result.IdToken,
+                AccessToken = result.AccessToken,
+                Expiration = result.IsExtendedLifeTimeToken ? result.ExtendedExpiresOn : result.ExpiresOn
+            };
+            SaveCache();
+
             switch (options.Type)
             {
                 case "id":
